@@ -11,6 +11,7 @@ function parseArgs(argv) {
     summaryIntervalSec: 30,
     debugHci: false,
     debugGap: false,
+    debugFilter: undefined,
     logDiscoveries: false,
     simulate: false,
     simulateOnMs: 15000,
@@ -36,6 +37,15 @@ function parseArgs(argv) {
     if (arg === '--debug-both') {
       options.debugHci = true;
       options.debugGap = true;
+      continue;
+    }
+    if (arg === '--debug-filter' && next != null) {
+      options.debugFilter = parseDebugFilter(next);
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--debug-filter=')) {
+      options.debugFilter = parseDebugFilter(arg.slice('--debug-filter='.length));
       continue;
     }
     if (arg === '--log-discoveries') {
@@ -126,6 +136,39 @@ function parseBoolean(value, defaultValue) {
   return defaultValue;
 }
 
+function parseDebugFilter(value) {
+  const parts = String(value)
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    throw new Error('Invalid --debug-filter: expected comma-separated values');
+  }
+
+  const normalized = new Set();
+  for (const part of parts) {
+    if (part === 'all') {
+      normalized.add('debug');
+      normalized.add('log');
+      normalized.add('warn');
+      normalized.add('error');
+      continue;
+    }
+    if (part === 'info') {
+      normalized.add('log');
+      continue;
+    }
+    if (part === 'debug' || part === 'log' || part === 'warn' || part === 'error') {
+      normalized.add(part);
+      continue;
+    }
+    throw new Error(`Invalid --debug-filter value: ${part}`);
+  }
+
+  return normalized;
+}
+
 function addDebugNamespaces(currentValue, namespaces) {
   const set = new Set(
     String(currentValue || '')
@@ -141,6 +184,55 @@ function addDebugNamespaces(currentValue, namespaces) {
   }
 
   return [...set].join(',');
+}
+
+function installDebugOutputFilter(filterSet) {
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const debugModule = require('debug');
+  const originalDebugLog = debugModule.log;
+
+  const allow = (kind) => filterSet.has(kind);
+
+  console.log = function filteredLog(...args) {
+    if (allow('log')) {
+      return originalLog.apply(console, args);
+    }
+  };
+
+  console.info = function filteredInfo(...args) {
+    if (allow('log')) {
+      return originalInfo.apply(console, args);
+    }
+  };
+
+  console.warn = function filteredWarn(...args) {
+    if (allow('warn')) {
+      return originalWarn.apply(console, args);
+    }
+  };
+
+  console.error = function filteredError(...args) {
+    if (allow('error')) {
+      return originalError.apply(console, args);
+    }
+  };
+
+  debugModule.log = function filteredDebugLog(...args) {
+    if (allow('debug')) {
+      return originalDebugLog.apply(this, args);
+    }
+  };
+
+  return () => {
+    console.log = originalLog;
+    console.info = originalInfo;
+    console.warn = originalWarn;
+    console.error = originalError;
+    debugModule.log = originalDebugLog;
+  };
 }
 
 function printHelp() {
@@ -159,6 +251,7 @@ Options:
   --debug-hci              Enable DEBUG=hci output
   --debug-gap              Enable DEBUG=gap output
   --debug-both             Enable both DEBUG=hci and DEBUG=gap output
+  --debug-filter <csv>     Filter output when debug mode is enabled: debug,log|info,warn,error,all
   --log-discoveries        Print each discovery (can be noisy)
   -h, --help               Show this help
 `);
@@ -267,6 +360,10 @@ async function main() {
     return;
   }
 
+  if (options.debugFilter && !(options.debugHci || options.debugGap)) {
+    throw new Error('--debug-filter requires --debug-hci, --debug-gap, or --debug-both');
+  }
+
   if (process.platform !== 'linux') {
     console.error(`[noble-hci-watch] This tool is intended for Linux hosts. Current platform: ${process.platform}`);
   }
@@ -281,6 +378,9 @@ async function main() {
     }
     process.env.DEBUG = addDebugNamespaces(process.env.DEBUG, namespaces);
   }
+  const restoreDebugOutputFilter = options.debugFilter
+    ? installDebugOutputFilter(options.debugFilter)
+    : null;
 
   const counters = createCounters();
   const restoreWarn = installWarningTap(counters);
@@ -379,6 +479,9 @@ async function main() {
 
     printSummary(counters, true);
     restoreWarn();
+    if (restoreDebugOutputFilter) {
+      restoreDebugOutputFilter();
+    }
   };
 
   process.on('SIGINT', () => {
@@ -461,6 +564,7 @@ async function main() {
     simulateOffMs: options.simulateOffMs,
     debugHci: options.debugHci,
     debugGap: options.debugGap,
+    debugFilter: options.debugFilter ? [...options.debugFilter].sort() : null,
     logDiscoveries: options.logDiscoveries
   })}`);
 
