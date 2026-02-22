@@ -10,6 +10,7 @@ function parseArgs(argv) {
     allowDuplicates: true,
     summaryIntervalSec: 30,
     debugHci: false,
+    debugGap: false,
     logDiscoveries: false,
     simulate: false,
     simulateOnMs: 15000,
@@ -26,6 +27,15 @@ function parseArgs(argv) {
     }
     if (arg === '--debug-hci') {
       options.debugHci = true;
+      continue;
+    }
+    if (arg === '--debug-gap') {
+      options.debugGap = true;
+      continue;
+    }
+    if (arg === '--debug-both') {
+      options.debugHci = true;
+      options.debugGap = true;
       continue;
     }
     if (arg === '--log-discoveries') {
@@ -116,6 +126,23 @@ function parseBoolean(value, defaultValue) {
   return defaultValue;
 }
 
+function addDebugNamespaces(currentValue, namespaces) {
+  const set = new Set(
+    String(currentValue || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
+
+  for (const namespace of namespaces) {
+    if (namespace) {
+      set.add(namespace);
+    }
+  }
+
+  return [...set].join(',');
+}
+
 function printHelp() {
   console.log(`Usage: node tools/noble-hci-watch.js [options]
 
@@ -130,6 +157,8 @@ Options:
   --simulate-on-ms <ms>    Simulated scan-on window (default: 15000)
   --simulate-off-ms <ms>   Simulated scan-off/settle window (default: 500)
   --debug-hci              Enable DEBUG=hci output
+  --debug-gap              Enable DEBUG=gap output
+  --debug-both             Enable both DEBUG=hci and DEBUG=gap output
   --log-discoveries        Print each discovery (can be noisy)
   -h, --help               Show this help
 `);
@@ -242,9 +271,15 @@ async function main() {
     console.error(`[noble-hci-watch] This tool is intended for Linux hosts. Current platform: ${process.platform}`);
   }
 
-  if (options.debugHci) {
-    const currentDebug = process.env.DEBUG || '';
-    process.env.DEBUG = currentDebug ? `${currentDebug},hci` : 'hci';
+  if (options.debugHci || options.debugGap) {
+    const namespaces = [];
+    if (options.debugHci) {
+      namespaces.push('hci');
+    }
+    if (options.debugGap) {
+      namespaces.push('gap');
+    }
+    process.env.DEBUG = addDebugNamespaces(process.env.DEBUG, namespaces);
   }
 
   const counters = createCounters();
@@ -425,6 +460,7 @@ async function main() {
     simulateOnMs: options.simulateOnMs,
     simulateOffMs: options.simulateOffMs,
     debugHci: options.debugHci,
+    debugGap: options.debugGap,
     logDiscoveries: options.logDiscoveries
   })}`);
 
