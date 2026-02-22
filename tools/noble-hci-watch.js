@@ -10,7 +10,10 @@ function parseArgs(argv) {
     allowDuplicates: true,
     summaryIntervalSec: 30,
     debugHci: false,
-    logDiscoveries: false
+    logDiscoveries: false,
+    simulate: false,
+    simulateOnMs: 15000,
+    simulateOffMs: 500
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -27,6 +30,10 @@ function parseArgs(argv) {
     }
     if (arg === '--log-discoveries') {
       options.logDiscoveries = true;
+      continue;
+    }
+    if (arg === '--simulate') {
+      options.simulate = true;
       continue;
     }
     if (arg === '--no-duplicates') {
@@ -51,6 +58,24 @@ function parseArgs(argv) {
       options.summaryIntervalSec = Number.parseInt(arg.slice('--summary-interval='.length), 10);
       continue;
     }
+    if (arg === '--simulate-on-ms' && next != null) {
+      options.simulateOnMs = Number.parseInt(next, 10);
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--simulate-on-ms=')) {
+      options.simulateOnMs = Number.parseInt(arg.slice('--simulate-on-ms='.length), 10);
+      continue;
+    }
+    if (arg === '--simulate-off-ms' && next != null) {
+      options.simulateOffMs = Number.parseInt(next, 10);
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--simulate-off-ms=')) {
+      options.simulateOffMs = Number.parseInt(arg.slice('--simulate-off-ms='.length), 10);
+      continue;
+    }
     if (arg === '--extended' && next != null) {
       options.extended = parseBoolean(next, options.extended);
       i++;
@@ -66,6 +91,12 @@ function parseArgs(argv) {
 
   if (!Number.isInteger(options.summaryIntervalSec) || options.summaryIntervalSec <= 0) {
     throw new Error(`Invalid --summary-interval: ${options.summaryIntervalSec}`);
+  }
+  if (!Number.isInteger(options.simulateOnMs) || options.simulateOnMs < 100) {
+    throw new Error(`Invalid --simulate-on-ms: ${options.simulateOnMs}`);
+  }
+  if (!Number.isInteger(options.simulateOffMs) || options.simulateOffMs < 0) {
+    throw new Error(`Invalid --simulate-off-ms: ${options.simulateOffMs}`);
   }
   if (options.deviceId != null && !Number.isInteger(options.deviceId)) {
     throw new Error(`Invalid --device-id: ${options.deviceId}`);
@@ -95,6 +126,9 @@ Options:
   --extended <bool>        Enable extended scanning (default: true)
   --summary-interval <s>   Periodic summary interval in seconds (default: 30)
   --no-duplicates          Disable duplicate advertisements (default: duplicates enabled)
+  --simulate               Simulate plugin-like scan pause/resume cycling
+  --simulate-on-ms <ms>    Simulated scan-on window (default: 15000)
+  --simulate-off-ms <ms>   Simulated scan-off/settle window (default: 500)
   --debug-hci              Enable DEBUG=hci output
   --log-discoveries        Print each discovery (can be noisy)
   -h, --help               Show this help
@@ -111,7 +145,10 @@ function createCounters() {
     discoveriesByAddress: new Map(),
     stateChanges: 0,
     scanStarts: 0,
-    scanStops: 0
+    scanStops: 0,
+    simulateCycles: 0,
+    simulatePauseCount: 0,
+    simulateResumeCount: 0
   };
 }
 
@@ -227,6 +264,71 @@ async function main() {
   }
 
   let shuttingDown = false;
+  let simulateTimer = null;
+  let simulateRunning = false;
+  let adapterPoweredOn = false;
+  let scanExpectedOn = false;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const stopScanSafe = async (reason) => {
+    try {
+      if (typeof nobleInstance.stopScanningAsync === 'function') {
+        await nobleInstance.stopScanningAsync();
+      } else if (typeof nobleInstance.stopScanning === 'function') {
+        nobleInstance.stopScanning(() => {});
+      }
+      if (reason) {
+        console.log(`[noble-hci-watch] scan stop requested (${reason})`);
+      }
+    } catch (error) {
+      console.error('[noble-hci-watch] stopScanning failed:', error.message || error);
+    }
+  };
+
+  const startScanSafe = async (reason) => {
+    try {
+      await nobleInstance.startScanningAsync([], options.allowDuplicates);
+      if (reason) {
+        console.log(`[noble-hci-watch] scan start requested (${reason}) allowDuplicates=${options.allowDuplicates}`);
+      }
+      return true;
+    } catch (error) {
+      console.error('[noble-hci-watch] startScanning failed:', error.message || error);
+      return false;
+    }
+  };
+
+  const runSimulateLoop = async () => {
+    if (simulateRunning || !options.simulate || !adapterPoweredOn || shuttingDown) {
+      return;
+    }
+    simulateRunning = true;
+    console.log(`[noble-hci-watch] simulate mode enabled onMs=${options.simulateOnMs} offMs=${options.simulateOffMs}`);
+
+    while (!shuttingDown && options.simulate && adapterPoweredOn) {
+      if (!scanExpectedOn) {
+        scanExpectedOn = await startScanSafe('simulate resume');
+        counters.simulateResumeCount += 1;
+      }
+      if (shuttingDown || !adapterPoweredOn) break;
+      await sleep(options.simulateOnMs);
+      if (shuttingDown || !adapterPoweredOn) break;
+
+      if (scanExpectedOn) {
+        counters.simulatePauseCount += 1;
+        counters.simulateCycles += 1;
+        await stopScanSafe('simulate pause');
+        scanExpectedOn = false;
+      }
+      if (shuttingDown || !adapterPoweredOn) break;
+      if (options.simulateOffMs > 0) {
+        await sleep(options.simulateOffMs);
+      }
+    }
+
+    simulateRunning = false;
+  };
 
   const cleanup = async (reason) => {
     if (shuttingDown) return;
@@ -234,15 +336,11 @@ async function main() {
     console.log(`[noble-hci-watch] stopping (${reason})`);
 
     clearInterval(summaryTimer);
-    try {
-      if (typeof nobleInstance.stopScanningAsync === 'function') {
-        await nobleInstance.stopScanningAsync();
-      } else if (typeof nobleInstance.stopScanning === 'function') {
-        nobleInstance.stopScanning(() => {});
-      }
-    } catch (error) {
-      console.error('[noble-hci-watch] stopScanning failed:', error.message || error);
+    if (simulateTimer) {
+      clearTimeout(simulateTimer);
+      simulateTimer = null;
     }
+    await stopScanSafe('cleanup');
 
     printSummary(counters, true);
     restoreWarn();
@@ -258,16 +356,27 @@ async function main() {
   nobleInstance.on('stateChange', async (state) => {
     counters.stateChanges += 1;
     console.log(`[noble-hci-watch] state=${state}`);
+    adapterPoweredOn = state === 'poweredOn';
+    if (!adapterPoweredOn) {
+      scanExpectedOn = false;
+    }
 
     if (state !== 'poweredOn') {
       return;
     }
 
-    try {
-      await nobleInstance.startScanningAsync([], options.allowDuplicates);
+    if (options.simulate) {
+      if (simulateTimer) {
+        clearTimeout(simulateTimer);
+      }
+      simulateTimer = setTimeout(() => {
+        void runSimulateLoop();
+      }, 0);
+      return;
+    }
+    scanExpectedOn = await startScanSafe('initial');
+    if (scanExpectedOn) {
       console.log(`[noble-hci-watch] scanning started allowDuplicates=${options.allowDuplicates} extended=${options.extended} deviceId=${options.deviceId ?? 'default'}`);
-    } catch (error) {
-      console.error('[noble-hci-watch] startScanning failed:', error.message || error);
     }
   });
 
@@ -312,6 +421,9 @@ async function main() {
     extended: options.extended,
     allowDuplicates: options.allowDuplicates,
     summaryIntervalSec: options.summaryIntervalSec,
+    simulate: options.simulate,
+    simulateOnMs: options.simulateOnMs,
+    simulateOffMs: options.simulateOffMs,
     debugHci: options.debugHci,
     logDiscoveries: options.logDiscoveries
   })}`);
@@ -326,6 +438,9 @@ function printSummary(counters, final = false) {
   const discoveryTop = topEntries(counters.discoveriesByAddress, 5);
 
   console.log(`[noble-hci-watch] ${final ? 'final ' : ''}summary elapsed=${elapsedSec}s discoveries=${counters.discoveries} uniqueDevices=${counters.discoveriesByAddress.size} warnings=${counters.warningsTotal} hciIllegal=${counters.hciIllegalTotal} scanStarts=${counters.scanStarts} scanStops=${counters.scanStops}`);
+  if (counters.simulateCycles > 0 || counters.simulatePauseCount > 0 || counters.simulateResumeCount > 0) {
+    console.log(`[noble-hci-watch] simulate cycles=${counters.simulateCycles} pauses=${counters.simulatePauseCount} resumes=${counters.simulateResumeCount}`);
+  }
 
   if (illegalTop.length > 0) {
     console.log('[noble-hci-watch] illegal packet counts:', illegalTop.map(([kind, count]) => `${kind}=${count}`).join(' '));
